@@ -1,0 +1,10 @@
+# For detailed configuration reference, visit:
+# https://supabase.com/docs/guides/local-development/cli/config
+project_id = "open-brain-starter"
+
+[api]
+enabled = true
+port = 54321
+
+[db]
+port = 54322
