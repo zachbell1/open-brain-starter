@@ -100,7 +100,7 @@ async function dispatchTool(toolName: string, rawArgs: Record<string, unknown>, 
     args.limit = Math.max(1, Math.min(100, Number(args.limit) || 20));
   }
   if (args.threshold !== undefined) {
-    args.threshold = Math.max(0, Math.min(1, Number(args.threshold) || 0.3));
+    args.threshold = Math.max(0, Math.min(1, Number(args.threshold) ?? 0.3));
   }
   if (args.days !== undefined) {
     args.days = Math.max(1, Math.min(365, Number(args.days) || 30));
@@ -214,9 +214,7 @@ Deno.serve(async (req) => {
     );
   }
 
-  const accessKey =
-    req.headers.get("x-brain-key") ||
-    new URL(req.url).searchParams.get("key");
+  const accessKey = req.headers.get("x-brain-key");
   const expectedKey = Deno.env.get("BRAIN_ACCESS_KEY");
 
   if (!accessKey || accessKey !== expectedKey) {

@@ -72,8 +72,8 @@ read -p "Continue? [y/N] " -n 1 -r
 echo
 [[ $REPLY =~ ^[Yy]$ ]] || error "Aborted."
 
-# Link to the project
-supabase link --project-ref "$PROJECT_REF" 2>/dev/null || true
+# Link to the project (must succeed — otherwise db push targets the wrong project)
+supabase link --project-ref "$PROJECT_REF" || error "Failed to link Supabase project $PROJECT_REF. Check your SUPABASE_URL and CLI login."
 
 supabase db push --include-all
 info "Schema applied."

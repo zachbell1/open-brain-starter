@@ -48,11 +48,11 @@ Runs two parallel `match_thoughts` calls with different parameters:
 | Strategy | Threshold | Count | Post-filter |
 |----------|-----------|-------|-------------|
 | Factual | 0.25 | 15 | None (tight threshold does the work) |
-| Broad | 0.15 | 30 | Recent (last 14 days) AND high importance (>= 4) |
+| Broad | 0.15 | 30 | Recent (last 14 days) OR high importance (>= 4) |
 
-Results are merged by ID (highest similarity wins), deduplicated, and sorted by similarity.
+Results from both strategies are merged by ID (highest similarity wins), deduplicated, and sorted by similarity.
 
-This catches thoughts that a single-strategy search would miss: the factual path finds the best semantic matches, while the broad path surfaces recent context and high-importance thoughts that might fall below the tight threshold.
+This catches thoughts that a single-strategy search would miss: the factual path finds the best semantic matches, while the broad path surfaces recent context and high-importance thoughts that might fall below the tight threshold. The OR filter on the broad path is intentional -- it casts a wide net for recency and importance independently, then lets the merge + limit trim to the best results.
 
 ## Database Design
 
