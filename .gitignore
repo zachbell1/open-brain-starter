@@ -3,3 +3,4 @@
 node_modules/
 supabase/.temp/
 .codex-review-latest
+.DS_Store
