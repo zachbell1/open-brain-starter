@@ -36,10 +36,12 @@ Claude Code session --> | open-brain-mcp           |
 1. Claude calls `search_thoughts` with a natural language query
 2. Edge function generates an embedding for the query
 3. Calls the `match_thoughts` RPC function which:
-   - **Unfiltered searches** pull a candidate pool straight from the HNSW index
-     (`ORDER BY embedding <=> query LIMIT k`), then re-rank it by threshold,
-     supersession, and optional decay — the shape pgvector's index accelerates, so
-     search stays fast as the store grows
+   - **Unfiltered searches** select a bounded candidate pool
+     (`ORDER BY embedding <=> query LIMIT overfetch`) and re-rank just that pool by
+     threshold, supersession, and optional decay. The candidate scan is
+     HNSW-index-eligible — the planner serves it from the index for small fetches
+     or large tables; either way the supersession self-join and threshold now run
+     over ≤overfetch rows instead of the whole table, which is what removes the timeout
    - **Project / trust-tier filtered searches** run an exact scan over the smaller
      filtered set, which preserves recall
    - Optionally applies time-decay scoring (older thoughts score lower, high-importance thoughts decay slower)
@@ -75,11 +77,16 @@ Key design choices:
 
 Postgres function that performs vector similarity search with optional features:
 
-- **Index-aware execution**: unfiltered searches select an HNSW candidate pool
-  (`ORDER BY embedding <=> query LIMIT overfetch`) and re-rank it; filtered searches
-  scan the smaller filtered set exactly. A naive `WHERE 1 - (emb <=> q) > threshold`
-  with an expression `ORDER BY` would bypass the index and scan every row — fine at
-  ~1K rows, slow past ~15K — so the function deliberately avoids that shape.
+- **Bounded candidate selection**: unfiltered searches take a top-N pool via
+  `ORDER BY embedding <=> query LIMIT overfetch` (HNSW-index-eligible) and re-rank
+  it; filtered searches scan the smaller filtered set exactly. The old shape —
+  `WHERE 1 - (emb <=> q) > threshold` + a self-join + an expression `ORDER BY` —
+  could not use the index *and* ran the self-join over every row, so it scanned the
+  whole table (fine at ~1K rows, ~8s at ~15K). Bounding the pool is the fix; the
+  HNSW index is an additional accelerator the planner engages as the table grows.
+  (Measured on 20K synthetic rows: ~0.1s end-to-end via a bounded seq-scan top-N,
+  ~8ms when the index is forced — pgvector under-costs HNSW, so the planner may not
+  pick it until the table is larger.)
 - **Cosine similarity**: `1 - (embedding <=> query_embedding)` using pgvector's distance operator
 - **Supersession filtering**: LEFT JOIN to find thoughts that have been superseded; exclude them by default
 - **Time decay**: When `apply_decay = true`, raw similarity is multiplied by a penalty factor:

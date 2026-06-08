@@ -88,13 +88,18 @@ create index thoughts_embedding_hnsw_idx
 --     below that). Both are intentional: exact completeness/decay means scoring
 --     every row, which is the full scan this fix removes.
 --
--- VERIFY AFTER APPLY: EXPLAIN on the function CALL only shows "Function Scan"
--- (plpgsql internals are opaque), so confirm index use on the inner shape:
+-- VERIFY / PERF (measured on 20K synthetic rows, pg17 + pgvector): EXPLAIN on the
+-- function CALL only shows "Function Scan" (plpgsql internals are opaque). Inspect
+-- the inner candidate scan directly:
 --   SET hnsw.ef_search = 715;
 --   EXPLAIN ANALYZE SELECT th.* FROM thoughts th
 --     ORDER BY th.embedding <=> '<probe>'::extensions.vector(1536) LIMIT 500;
--- Expect `Index Scan using thoughts_embedding_hnsw_idx` (a Seq Scan = stale stats:
--- run `ANALYZE thoughts`). Or enable auto_explain.log_nested_statements.
+-- pgvector under-costs HNSW, so at moderate scale the planner may pick a bounded
+-- top-N Seq Scan (~0.1s here) instead of the index — correct and fast, and it
+-- switches to the index as the table grows. Forcing it (`SET enable_seqscan = off`)
+-- runs the same shape via `Index Scan using thoughts_embedding_hnsw_idx` in ~8ms.
+-- The win over the OLD shape (self-join + per-row distance filter, ~8s at 15K) is
+-- bounding the pool — independent of which scan the planner picks.
 create or replace function match_thoughts(
   query_embedding extensions.vector(1536),
   match_threshold float default 0.5,
@@ -143,7 +148,7 @@ begin
       -- only distance-EXPRESSION filters or expression sorts would defeat it.
       select th.*, (th.embedding <=> query_embedding) as dist
       from public.thoughts th
-      order by th.embedding <=> query_embedding   -- uses thoughts_embedding_hnsw_idx
+      order by th.embedding <=> query_embedding   -- HNSW-index-eligible top-N (planner: index for small k / large N)
       limit overfetch
     )
     select
