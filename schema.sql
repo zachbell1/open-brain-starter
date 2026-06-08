@@ -88,9 +88,13 @@ create index thoughts_embedding_hnsw_idx
 --     below that). Both are intentional: exact completeness/decay means scoring
 --     every row, which is the full scan this fix removes.
 --
--- VERIFY AFTER APPLY: EXPLAIN (ANALYZE) an unfiltered call should
--- show `Index Scan using thoughts_embedding_hnsw_idx`; a Seq Scan means stale
--- planner stats — run `ANALYZE thoughts`.
+-- VERIFY AFTER APPLY: EXPLAIN on the function CALL only shows "Function Scan"
+-- (plpgsql internals are opaque), so confirm index use on the inner shape:
+--   SET hnsw.ef_search = 715;
+--   EXPLAIN ANALYZE SELECT th.* FROM thoughts th
+--     ORDER BY th.embedding <=> '<probe>'::extensions.vector(1536) LIMIT 500;
+-- Expect `Index Scan using thoughts_embedding_hnsw_idx` (a Seq Scan = stale stats:
+-- run `ANALYZE thoughts`). Or enable auto_explain.log_nested_statements.
 create or replace function match_thoughts(
   query_embedding extensions.vector(1536),
   match_threshold float default 0.5,
