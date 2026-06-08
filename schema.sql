@@ -51,13 +51,55 @@ create index thoughts_related_to_idx on public.thoughts using gin (related_to);
 create index thoughts_trust_tier_idx on public.thoughts (trust_tier);
 
 -- HNSW vector index for fast approximate nearest-neighbor search.
--- Good to ~100K rows without maintenance. At 10K+ rows, consider bumping
--- ef_construction to 128 if query latency increases.
+-- match_thoughts (below) queries it via an `ORDER BY embedding <=> q LIMIT k`
+-- candidate pool — the only shape pgvector's HNSW index accelerates.
+-- Good to ~100K rows; at 10K+ consider bumping ef_construction to 128 if query
+-- latency rises. Note: this pgvector build caps hnsw.ef_search at 1000.
 create index thoughts_embedding_hnsw_idx
   on public.thoughts using hnsw (embedding extensions.vector_cosine_ops)
   with (m = 16, ef_construction = 64);
 
 -- 4. Semantic search function (with optional time-decay scoring)
+--
+-- Two query paths so the HNSW index is actually used as the store grows:
+--   * Unfiltered (the common case): an inner CTE selects a candidate pool by pure
+--     ANN distance (`ORDER BY embedding <=> q LIMIT overfetch`) — the only shape
+--     pgvector's HNSW index accelerates — then the supersession join, threshold,
+--     and optional decay re-rank run over that small pool.
+--   * Filtered by project/trust_tier: keep the EXACT scan. Those filters shrink the
+--     row set (already fast) and an ANN over-fetch could miss in-scope rows that
+--     rank past the pool globally — so the exact path preserves recall.
+--
+-- Why it matters: a WHERE on the distance EXPRESSION (`1 - (emb <=> q) > thr`), a
+-- self-join, or an expression ORDER BY all DEFEAT the HNSW index and force an exact
+-- scan over every row. Fine at ~1K rows; it exceeds the statement timeout as the
+-- store grows (measured in the full Open Brain at ~15.5K rows). ANN over-fetch +
+-- re-rank scales.
+--
+-- TRADEOFFS (inherent to ANN over-fetch; bounded by the 500-deep pool):
+--   * Completeness: match_threshold and supersession are applied AFTER the LIMIT,
+--     so an unfiltered search only ranks the top ~overfetch candidates by raw
+--     distance. With match_count default 10 that is a ~50x buffer; for an
+--     exhaustive set past the pool, use a project/trust_tier filter (exact path).
+--   * Decay ranking: the pool is chosen by raw distance, then re-scored. Because
+--     the decay factor is bounded to [0.5, 1.0], a fresher row just outside the
+--     pool can only outrank an in-pool row when in-pool similarities are already
+--     low — negligible until the store passes ~overfetch rows (pool = full table
+--     below that). Both are intentional: exact completeness/decay means scoring
+--     every row, which is the full scan this fix removes.
+--
+-- VERIFY / PERF (measured on 20K synthetic rows, pg17 + pgvector): EXPLAIN on the
+-- function CALL only shows "Function Scan" (plpgsql internals are opaque). Inspect
+-- the inner candidate scan directly:
+--   SET hnsw.ef_search = 715;
+--   EXPLAIN ANALYZE SELECT th.* FROM thoughts th
+--     ORDER BY th.embedding <=> '<probe>'::extensions.vector(1536) LIMIT 500;
+-- pgvector under-costs HNSW, so at moderate scale the planner may pick a bounded
+-- top-N Seq Scan (~0.1s here) instead of the index — correct and fast, and it
+-- switches to the index as the table grows. Forcing it (`SET enable_seqscan = off`)
+-- runs the same shape via `Index Scan using thoughts_embedding_hnsw_idx` in ~8ms.
+-- The win over the OLD shape (self-join + per-row distance filter, ~8s at 15K) is
+-- bounding the pool — independent of which scan the planner picks.
 create or replace function match_thoughts(
   query_embedding extensions.vector(1536),
   match_threshold float default 0.5,
@@ -88,50 +130,90 @@ language plpgsql
 security invoker
 set search_path = public, extensions
 as $$
+declare
+  -- 500-deep candidate pool: >= match_count (never truncates a large request) and
+  -- deep enough that the bounded [0.5, 1.0] decay factor cannot lift an outside row
+  -- past it. (Exact decay would mean scoring every row — the full scan we avoid.)
+  overfetch int := greatest(500, match_count);
+  -- Widen ef_search toward the pool size for recall, clamped to this build's
+  -- hnsw.ef_search ceiling (1..1000). Transaction-local (third arg = true).
+  ef_target int := least(1000, ceil(overfetch / 0.7)::int);
 begin
-  return query
-  select
-    t.id,
-    t.content,
-    t.thought_type,
-    t.topics,
-    t.people,
-    t.action_items,
-    t.project,
-    t.importance,
-    t.source,
-    t.created_at,
-    case when apply_decay then
-      -- Decay formula: raw similarity * time penalty (older = lower, high importance = slower decay)
-      (1 - (t.embedding <=> query_embedding)) * least(1.0,
-        greatest(0.5, 1.0 - (extract(epoch from (now() - t.created_at)) / 86400.0 / 365.0)
-          * (1.0 - t.importance::float / 5.0))
-        + case when s.id is null then 0.05 else 0.0 end
-      )
-    else
-      1 - (t.embedding <=> query_embedding)
-    end as similarity,
-    t.supersedes_id,
-    s.id as superseded_by,
-    t.related_to,
-    t.trust_tier
-  from public.thoughts t
-  left join public.thoughts s on s.supersedes_id = t.id
-  where 1 - (t.embedding <=> query_embedding) > match_threshold
-    and (filter_project is null or t.project = filter_project)
-    and (include_superseded or s.id is null)
-    and (filter_trust_tier is null or t.trust_tier = filter_trust_tier)
-  order by
-    case when apply_decay then
-      (1 - (t.embedding <=> query_embedding)) * least(1.0,
-        greatest(0.5, 1.0 - (extract(epoch from (now() - t.created_at)) / 86400.0 / 365.0)
-          * (1.0 - t.importance::float / 5.0))
-        + case when s.id is null then 0.05 else 0.0 end
-      )
-    else
-      1 - (t.embedding <=> query_embedding)
-    end desc
-  limit match_count;
+  if filter_project is null and filter_trust_tier is null then
+    -- ---- HNSW fast path (unfiltered) ----
+    perform set_config('hnsw.ef_search', ef_target::text, true);
+    return query
+    with ann as (
+      -- A plain `ORDER BY embedding <=> q LIMIT k` keeps the HNSW index in the plan;
+      -- only distance-EXPRESSION filters or expression sorts would defeat it.
+      select th.*, (th.embedding <=> query_embedding) as dist
+      from public.thoughts th
+      order by th.embedding <=> query_embedding   -- HNSW-index-eligible top-N (planner: index for small k / large N)
+      limit overfetch
+    )
+    select
+      t.id, t.content, t.thought_type, t.topics, t.people, t.action_items,
+      t.project, t.importance, t.source, t.created_at,
+      case when apply_decay then
+        -- Decay formula: raw similarity * time penalty (older = lower, high importance = slower decay)
+        (1 - t.dist) * least(1.0,
+          greatest(0.5, 1.0 - (extract(epoch from (now() - t.created_at)) / 86400.0 / 365.0)
+            * (1.0 - t.importance::float / 5.0))
+          + case when s.id is null then 0.05 else 0.0 end
+        )
+      else
+        1 - t.dist
+      end as similarity,
+      t.supersedes_id, s.id as superseded_by, t.related_to, t.trust_tier
+    from ann t
+    left join public.thoughts s on s.supersedes_id = t.id
+    where 1 - t.dist > match_threshold
+      and (include_superseded or s.id is null)
+    order by
+      case when apply_decay then
+        (1 - t.dist) * least(1.0,
+          greatest(0.5, 1.0 - (extract(epoch from (now() - t.created_at)) / 86400.0 / 365.0)
+            * (1.0 - t.importance::float / 5.0))
+          + case when s.id is null then 0.05 else 0.0 end
+        )
+      else
+        1 - t.dist
+      end desc
+    limit match_count;
+  else
+    -- ---- Exact path (filtered) — small row set, recall-preserving ----
+    return query
+    select
+      t.id, t.content, t.thought_type, t.topics, t.people, t.action_items,
+      t.project, t.importance, t.source, t.created_at,
+      case when apply_decay then
+        (1 - (t.embedding <=> query_embedding)) * least(1.0,
+          greatest(0.5, 1.0 - (extract(epoch from (now() - t.created_at)) / 86400.0 / 365.0)
+            * (1.0 - t.importance::float / 5.0))
+          + case when s.id is null then 0.05 else 0.0 end
+        )
+      else
+        1 - (t.embedding <=> query_embedding)
+      end as similarity,
+      t.supersedes_id, s.id as superseded_by, t.related_to, t.trust_tier
+    from public.thoughts t
+    left join public.thoughts s on s.supersedes_id = t.id
+    where 1 - (t.embedding <=> query_embedding) > match_threshold
+      and (filter_project is null or t.project = filter_project)
+      and (include_superseded or s.id is null)
+      and (filter_trust_tier is null or t.trust_tier = filter_trust_tier)
+    order by
+      case when apply_decay then
+        (1 - (t.embedding <=> query_embedding)) * least(1.0,
+          greatest(0.5, 1.0 - (extract(epoch from (now() - t.created_at)) / 86400.0 / 365.0)
+            * (1.0 - t.importance::float / 5.0))
+          + case when s.id is null then 0.05 else 0.0 end
+        )
+      else
+        1 - (t.embedding <=> query_embedding)
+      end desc
+    limit match_count;
+  end if;
 end;
 $$;
 
