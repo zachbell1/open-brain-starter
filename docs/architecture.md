@@ -36,8 +36,12 @@ Claude Code session --> | open-brain-mcp           |
 1. Claude calls `search_thoughts` with a natural language query
 2. Edge function generates an embedding for the query
 3. Calls the `match_thoughts` RPC function which:
-   - Computes cosine similarity against all thought embeddings (via HNSW index)
-   - Filters by threshold, project, trust tier, and supersession status
+   - **Unfiltered searches** pull a candidate pool straight from the HNSW index
+     (`ORDER BY embedding <=> query LIMIT k`), then re-rank it by threshold,
+     supersession, and optional decay — the shape pgvector's index accelerates, so
+     search stays fast as the store grows
+   - **Project / trust-tier filtered searches** run an exact scan over the smaller
+     filtered set, which preserves recall
    - Optionally applies time-decay scoring (older thoughts score lower, high-importance thoughts decay slower)
 4. Returns matching thoughts ranked by similarity
 
@@ -71,6 +75,11 @@ Key design choices:
 
 Postgres function that performs vector similarity search with optional features:
 
+- **Index-aware execution**: unfiltered searches select an HNSW candidate pool
+  (`ORDER BY embedding <=> query LIMIT overfetch`) and re-rank it; filtered searches
+  scan the smaller filtered set exactly. A naive `WHERE 1 - (emb <=> q) > threshold`
+  with an expression `ORDER BY` would bypass the index and scan every row — fine at
+  ~1K rows, slow past ~15K — so the function deliberately avoids that shape.
 - **Cosine similarity**: `1 - (embedding <=> query_embedding)` using pgvector's distance operator
 - **Supersession filtering**: LEFT JOIN to find thoughts that have been superseded; exclude them by default
 - **Time decay**: When `apply_decay = true`, raw similarity is multiplied by a penalty factor:
@@ -86,7 +95,8 @@ Postgres function that performs vector similarity search with optional features:
 Approximate nearest-neighbor index on the embedding column:
 - **m = 16**: connections per node (higher = better recall, more memory)
 - **ef_construction = 64**: build-time search depth (higher = better index quality, slower build)
-- Good to ~100K rows. At 10K+ rows, consider bumping `ef_construction` to 128 if query latency increases.
+- **ef_search**: set per-query (transaction-local) by `match_thoughts`; this pgvector build caps it at 1000
+- `match_thoughts` uses this index for unfiltered searches (see above). Good to ~100K rows. At 10K+ rows, consider bumping `ef_construction` to 128 if query latency increases.
 
 ### Security Model
 
